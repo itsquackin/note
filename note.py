@@ -438,36 +438,6 @@ def multiline_input(existing: str = "", hint: bool = True) -> str:
     return existing
 
 
-def external_editor_input(existing: str = "") -> Optional[str]:
-    editor = os.environ.get("EDITOR")
-    if not editor:
-        print(c("    ⚠ $EDITOR not set. Falling back to inline editor.", "33"))
-        return None
-    with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False) as tmp:
-        path = tmp.name
-        if existing:
-            tmp.write(existing)
-            tmp.flush()
-    try:
-        cmd = shlex.split(editor) + [path]
-        subprocess.call(cmd)
-        with open(path, "r", encoding="utf-8") as handle:
-            return handle.read().rstrip("\n")
-    finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
-
-def body_input(existing: str, hint: bool, settings: Dict[str, Any]) -> str:
-    if settings.get("use_external_editor", False):
-        edited = external_editor_input(existing)
-        if edited is not None:
-            return edited
-    return multiline_input(existing=existing, hint=hint)
-
-
 def build_meeting_note_body() -> str:
     print(c("    Fill in meeting sections. Use :done on a blank line to finish each section.", "90"))
     print()
@@ -537,6 +507,11 @@ def create_note(data: Dict[str, Any]) -> None:
     tags = parse_tags(raw_tags) if raw_tags else []
 
     print()
+    if category not in cats:
+        cats.append(category)
+        data["categories"] = cats
+
+    print()
     if template_name.lower() == "meeting notes":
         body = build_meeting_note_body()
     else:
@@ -544,6 +519,7 @@ def create_note(data: Dict[str, Any]) -> None:
         if initial:
             print(c(f"    Template loaded: {template_name}\n", "36"))
         body = body_input(existing=initial, hint=data.get("settings", {}).get("editor_hint", True), settings=data.get("settings", {}))
+        body = multiline_input(existing=initial, hint=data.get("settings", {}).get("editor_hint", True))
     if body == "__CANCEL__":
         print("    Cancelled.")
         pause()
@@ -593,6 +569,24 @@ def view_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
                 if 0 <= sel < len(link_targets):
                     open_note_target(data, link_targets[sel]["note"])
         elif ch == "0": return
+    while True:
+        clear()
+        draw_header(f"📄 Note #{note.get('id', 0)}")
+        display_note_full(note)
+        draw_inline_menu([
+            ("1", "Edit"), ("2", "Append"), ("3", "Pin/Unpin"),
+            ("4", "Duplicate"), ("5", "Archive"), ("6", "Delete"), ("0", "Back"),
+        ])
+        ch = draw_prompt()
+        if ch == "1":   edit_note(data, note)
+        elif ch == "2": append_to_note(data, note)
+        elif ch == "3": toggle_pin(data, note)
+        elif ch == "4": duplicate_note(data, note); return
+        elif ch == "5": archive_note(data, note); return
+        elif ch == "6":
+            if trash_note(data, note):
+                return
+        elif ch == "0": return
 
 
 def edit_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
@@ -623,6 +617,7 @@ def edit_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
             pushed_undo = True
         note["tags"] = parse_tags(raw_tags)
     print(f"\n    Edit body? (y/n) [n]: ", end="")
+    print(f"\n    Edit body? (y/n) [n]: ", end="")
     if input().strip().lower() == "y":
         print(c("\n    Current body:", "90"))
         print(wrap_text(note.get("body", ""), indent="      "))
@@ -633,6 +628,7 @@ def edit_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
                 push_undo(data, f"Rewrite #{note['id']}")
                 pushed_undo = True
             body = body_input(existing="", hint=True, settings=data.get("settings", {}))
+            body = multiline_input()
             if body != "__CANCEL__":
                 note["body"] = body
         elif ec == "2":
@@ -640,6 +636,7 @@ def edit_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
                 push_undo(data, f"Edit body #{note['id']}")
                 pushed_undo = True
             body = body_input(existing=note.get("body", ""), hint=True, settings=data.get("settings", {}))
+            body = multiline_input(existing=note.get("body", ""))
             if body != "__CANCEL__":
                 note["body"] = body
     note["updated_at"] = now_iso()
@@ -784,6 +781,7 @@ def open_note_by_id(data: Dict[str, Any], raw: str) -> None:
     pause()
 
 
+def browse_notes(data: Dict[str, Any]) -> None:
 def browse_notes(data: Dict[str, Any]) -> None:
     cat_filter: Optional[str] = None
     sort_mode = "recent"
@@ -963,6 +961,15 @@ def view_archived_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
         if confirm == "y":
             restore_archived_note(data, note)
             view_note(data, note)
+    draw_inline_menu([("1", "Restore to active"), ("0", "Back")])
+    if draw_prompt() == "1":
+        push_undo(data, f"Restore #{note['id']}")
+        data["archive"] = [n for n in data["archive"] if n.get("id") != note["id"]]
+        note.pop("archived_at", None)
+        data["notes"].append(note)
+        save_data(data)
+        print(f"    {c('✓ Restored', '1;32')}")
+        pause()
 
 
 def view_trashed_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
@@ -980,6 +987,15 @@ def view_trashed_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
         if confirm == "y":
             restore_trashed_note(data, note)
             view_note(data, note)
+    draw_inline_menu([("1", "Restore to active"), ("0", "Back")])
+    if draw_prompt() == "1":
+        push_undo(data, f"Restore #{note['id']} from trash")
+        data["trash"] = [n for n in data["trash"] if n.get("id") != note["id"]]
+        note.pop("trashed_at", None)
+        data["notes"].append(note)
+        save_data(data)
+        print(f"    {c('✓ Restored', '1;32')}")
+        pause()
 
 
 # ════════════════════════════════════════════════════════════════
