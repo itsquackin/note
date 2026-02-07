@@ -29,7 +29,10 @@ import json
 import os
 import re
 import shutil
+import shlex
+import subprocess
 import sys
+import tempfile
 import textwrap
 import time as time_module
 from datetime import datetime, date, timedelta
@@ -184,6 +187,7 @@ DEFAULT_DATA: Dict[str, Any] = {
         "default_category": "General",
         "editor_hint": True,
         "trash_days": 30,
+        "use_external_editor": False,
     },
     "undo_stack": [],
 }
@@ -274,6 +278,55 @@ CATEGORY_COLORS = {
 def cat_color(category: str) -> str:
     return CATEGORY_COLORS.get(category.lower(), "37")
 
+
+def parse_tags(raw: str) -> List[str]:
+    tags = [t.strip() for t in raw.split(",") if t.strip()]
+    seen = set()
+    unique = []
+    for tag in tags:
+        key = tag.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(tag)
+    return unique
+
+
+def format_tags(tags: List[str]) -> str:
+    if not tags:
+        return ""
+    return ", ".join(tags)
+
+
+def extract_links(body: str) -> Tuple[List[int], List[str]]:
+    ids = [int(n) for n in re.findall(r"\B#(\d+)\b", body)]
+    titles = [t.strip() for t in re.findall(r"\[\[([^\]]+)\]\]", body)]
+    return ids, titles
+
+
+def resolve_link_targets(data: Dict[str, Any], body: str) -> List[Dict[str, Any]]:
+    ids, titles = extract_links(body)
+    targets = []
+    all_notes = data.get("notes", []) + data.get("archive", []) + data.get("trash", [])
+    for nid in ids:
+        note = next((n for n in all_notes if n.get("id") == nid), None)
+        if note:
+            targets.append({"label": f"#{nid} {note.get('title', 'Untitled')}", "note": note})
+    for title in titles:
+        note = next((n for n in all_notes if (n.get("title") or "").lower() == title.lower()), None)
+        if note:
+            targets.append({"label": f"[[{title}]] → #{note.get('id')}", "note": note})
+    return targets
+
+
+def open_note_target(data: Dict[str, Any], note: Dict[str, Any]) -> None:
+    nid = note.get("id")
+    if any(n.get("id") == nid for n in data.get("notes", [])):
+        view_note(data, note)
+    elif any(n.get("id") == nid for n in data.get("archive", [])):
+        view_archived_note(data, note)
+    elif any(n.get("id") == nid for n in data.get("trash", [])):
+        view_trashed_note(data, note)
+
 def format_note_line(note: Dict[str, Any], show_preview: bool = True) -> str:
     nid = note.get("id", 0)
     title = note.get("title", "Untitled")
@@ -282,11 +335,13 @@ def format_note_line(note: Dict[str, Any], show_preview: bool = True) -> str:
     created = note.get("created_at", "")[:10]
     updated = note.get("updated_at")
     body = note.get("body", "")
+    tags = note.get("tags", [])
     wc = len(body.split()) if body else 0
 
     pin = c("📌", "1;33") if pinned else "  "
     edited = c(" ✎", "90") if (updated and updated != note.get("created_at")) else ""
-    line = f"    {pin} {c(f'#{nid:<4}', '1;37')}  {c(created, '90')}  {c(f'[{cat}]', cat_color(cat)):<22} {title}{edited}  {c(f'{wc}w', '90')}"
+    tag_display = f" {c('· ' + ', '.join(tags), '90')}" if tags else ""
+    line = f"    {pin} {c(f'#{nid:<4}', '1;37')}  {c(created, '90')}  {c(f'[{cat}]', cat_color(cat)):<22} {title}{edited}{tag_display}  {c(f'{wc}w', '90')}"
 
     if show_preview and body:
         preview = body.replace("\n", " ").strip()
@@ -306,6 +361,7 @@ def display_note_full(note: Dict[str, Any]) -> None:
     updated = note.get("updated_at")
     pinned = note.get("pinned", False)
     nid = note.get("id", 0)
+    tags = note.get("tags", [])
     wc = len(body.split()) if body else 0
     cc = len(body)
     pin_mark = " 📌" if pinned else ""
@@ -318,6 +374,13 @@ def display_note_full(note: Dict[str, Any]) -> None:
         meta += c(f"  ·  edited {updated[:16]}", "90")
     print(f"  {c('│', '90')} {meta}")
     print(c(f"  └{'─' * inner}┘", "90"))
+
+    tags_line = format_tags(tags) or "None"
+    updated_line = updated[:16] if updated else "—"
+    print(f"  {c('Category:', '90')} {cat}")
+    print(f"  {c('Tags:', '90')} {tags_line}")
+    print(f"  {c('Created:', '90')} {created[:16]}")
+    print(f"  {c('Updated:', '90')} {updated_line}")
 
     if body:
         print()
@@ -440,6 +503,14 @@ def create_note(data: Dict[str, Any]) -> None:
         cats.append(category)
         data["categories"] = cats
 
+    raw_tags = input("    Tags (comma-separated, optional): ").strip()
+    tags = parse_tags(raw_tags) if raw_tags else []
+
+    print()
+    if category not in cats:
+        cats.append(category)
+        data["categories"] = cats
+
     print()
     if template_name.lower() == "meeting notes":
         body = build_meeting_note_body()
@@ -447,6 +518,7 @@ def create_note(data: Dict[str, Any]) -> None:
         initial = template_body if templates and template_body else ""
         if initial:
             print(c(f"    Template loaded: {template_name}\n", "36"))
+        body = body_input(existing=initial, hint=data.get("settings", {}).get("editor_hint", True), settings=data.get("settings", {}))
         body = multiline_input(existing=initial, hint=data.get("settings", {}).get("editor_hint", True))
     if body == "__CANCEL__":
         print("    Cancelled.")
@@ -455,7 +527,7 @@ def create_note(data: Dict[str, Any]) -> None:
 
     note = {
         "id": next_id(data), "title": title, "body": body,
-        "category": category, "created_at": now_iso(),
+        "category": category, "tags": tags, "created_at": now_iso(),
         "updated_at": now_iso(), "pinned": False,
     }
     push_undo(data, f"Create note #{note['id']}")
@@ -466,6 +538,37 @@ def create_note(data: Dict[str, Any]) -> None:
 
 
 def view_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
+    while True:
+        clear()
+        draw_header(f"📄 Note #{note.get('id', 0)}")
+        display_note_full(note)
+        link_targets = resolve_link_targets(data, note.get("body", ""))
+        options = [
+            ("1", "Edit"), ("2", "Append"), ("3", "Pin/Unpin"),
+            ("4", "Duplicate"), ("5", "Archive"), ("6", "Delete"), ("0", "Back"),
+        ]
+        if link_targets:
+            options.insert(6, ("7", "Open link"))
+        draw_inline_menu(options)
+        ch = draw_prompt()
+        if ch == "1":   edit_note(data, note)
+        elif ch == "2": append_to_note(data, note)
+        elif ch == "3": toggle_pin(data, note)
+        elif ch == "4": duplicate_note(data, note); return
+        elif ch == "5": archive_note(data, note); return
+        elif ch == "6":
+            if trash_note(data, note):
+                return
+        elif ch == "7" and link_targets:
+            print()
+            for idx, target in enumerate(link_targets, 1):
+                print(f"    {c(f'[{idx}]', '36')} {target['label']}")
+            raw = input("    Open link #: ").strip()
+            if raw.isdigit():
+                sel = int(raw) - 1
+                if 0 <= sel < len(link_targets):
+                    open_note_target(data, link_targets[sel]["note"])
+        elif ch == "0": return
     while True:
         clear()
         draw_header(f"📄 Note #{note.get('id', 0)}")
@@ -506,6 +609,14 @@ def edit_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
         note["category"] = new_cat
         if new_cat not in cats:
             cats.append(new_cat)
+    current_tags = format_tags(note.get("tags", []))
+    raw_tags = input(f"    Tags [{current_tags or 'none'}]: ").strip()
+    if raw_tags:
+        if not pushed_undo:
+            push_undo(data, f"Edit note #{note['id']}")
+            pushed_undo = True
+        note["tags"] = parse_tags(raw_tags)
+    print(f"\n    Edit body? (y/n) [n]: ", end="")
     print(f"\n    Edit body? (y/n) [n]: ", end="")
     if input().strip().lower() == "y":
         print(c("\n    Current body:", "90"))
@@ -516,6 +627,7 @@ def edit_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
             if not pushed_undo:
                 push_undo(data, f"Rewrite #{note['id']}")
                 pushed_undo = True
+            body = body_input(existing="", hint=True, settings=data.get("settings", {}))
             body = multiline_input()
             if body != "__CANCEL__":
                 note["body"] = body
@@ -523,6 +635,7 @@ def edit_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
             if not pushed_undo:
                 push_undo(data, f"Edit body #{note['id']}")
                 pushed_undo = True
+            body = body_input(existing=note.get("body", ""), hint=True, settings=data.get("settings", {}))
             body = multiline_input(existing=note.get("body", ""))
             if body != "__CANCEL__":
                 note["body"] = body
@@ -536,7 +649,7 @@ def append_to_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
     clear()
     draw_header(f"📎 Append to: {note['title']}")
     print(c("    Add text to the end of this note:\n", "90"))
-    body = multiline_input()
+    body = body_input(existing="", hint=True, settings=data.get("settings", {}))
     if body == "__CANCEL__" or not body.strip():
         print("    Cancelled.")
         pause()
@@ -563,6 +676,7 @@ def duplicate_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
     new_note = {
         "id": next_id(data), "title": note["title"] + " (copy)",
         "body": note.get("body", ""), "category": note.get("category", "General"),
+        "tags": list(note.get("tags", [])),
         "created_at": now_iso(), "updated_at": now_iso(), "pinned": False,
     }
     push_undo(data, f"Duplicate #{note['id']}")
@@ -623,14 +737,14 @@ def sort_notes(notes: List[Dict], mode: str = "recent", pinned_first: bool = Tru
         elif mode == "oldest":
             return (pin, "")  # we reverse at end
         elif mode == "alpha":
-            return (0, (n.get("title") or "").lower())
+            return (pin, (n.get("title") or "").lower())
         elif mode == "alpha_r":
-            return (0, (n.get("title") or "").lower())
+            return (pin, (n.get("title") or "").lower())
         elif mode == "words":
             wc = len((n.get("body") or "").split())
             return (pin, wc)
         elif mode == "category":
-            return (0, (n.get("category") or "").lower(), ts)
+            return (pin, (n.get("category") or "").lower(), ts)
         return (pin, ts)
 
     reverse = mode in ("recent", "alpha_r", "words")
@@ -667,6 +781,7 @@ def open_note_by_id(data: Dict[str, Any], raw: str) -> None:
     pause()
 
 
+def browse_notes(data: Dict[str, Any]) -> None:
 def browse_notes(data: Dict[str, Any]) -> None:
     cat_filter: Optional[str] = None
     sort_mode = "recent"
@@ -743,6 +858,13 @@ def browse_notes(data: Dict[str, Any]) -> None:
         elif ch == "0": return
 
 
+def highlight_matches(text: str, keywords: List[str]) -> str:
+    highlighted = text
+    for kw in keywords:
+        highlighted = re.sub(re.escape(kw), lambda m: c(m.group(), "1;33"), highlighted, flags=re.IGNORECASE)
+    return highlighted
+
+
 def search_notes(data: Dict[str, Any]) -> None:
     clear()
     draw_header("🔍 Search Notes", "Searches titles & bodies of all notes including archived")
@@ -753,7 +875,8 @@ def search_notes(data: Dict[str, Any]) -> None:
     all_notes = data.get("notes", []) + data.get("archive", [])
     results = []
     for note in all_notes:
-        searchable = f"{(note.get('title') or '')} {(note.get('body') or '')} {(note.get('category') or '')}".lower()
+        tags = " ".join(note.get("tags", []))
+        searchable = f"{(note.get('title') or '')} {(note.get('body') or '')} {(note.get('category') or '')} {tags}".lower()
         if all(kw in searchable for kw in keywords):
             score = sum(searchable.count(kw) for kw in keywords)
             if all(kw in (note.get("title") or "").lower() for kw in keywords):
@@ -771,6 +894,21 @@ def search_notes(data: Dict[str, Any]) -> None:
     for note, score, is_arch in results[:20]:
         arch_tag = c(" [ARCHIVED]", "90") if is_arch else ""
         print(format_note_line(note, show_preview=False) + arch_tag)
+        title = note.get("title", "")
+        category = note.get("category", "")
+        tags = format_tags(note.get("tags", []))
+        title_match = any(kw in title.lower() for kw in keywords)
+        cat_match = any(kw in category.lower() for kw in keywords)
+        tag_match = any(kw in tags.lower() for kw in keywords)
+        if title_match or cat_match or tag_match:
+            parts = []
+            if title_match:
+                parts.append(f"Title: {highlight_matches(title, keywords)}")
+            if cat_match:
+                parts.append(f"Category: {highlight_matches(category, keywords)}")
+            if tag_match:
+                parts.append(f"Tags: {highlight_matches(tags, keywords)}")
+            print(f"           {c(' · ', '90').join(parts)}")
         body = note.get("body", "")
         if body:
             for kw in keywords:
@@ -781,7 +919,7 @@ def search_notes(data: Dict[str, Any]) -> None:
                     snippet = body[start:end].replace("\n", " ")
                     if start > 0: snippet = "…" + snippet
                     if end < len(body): snippet += "…"
-                    highlighted = re.sub(re.escape(kw), lambda m: c(m.group(), "1;33"), snippet, flags=re.IGNORECASE)
+                    highlighted = highlight_matches(snippet, [kw])
                     print(f"           {highlighted}")
                     break
         print()
@@ -792,10 +930,37 @@ def search_notes(data: Dict[str, Any]) -> None:
         open_note_by_id(data, raw)
 
 
+def restore_archived_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
+    push_undo(data, f"Restore #{note['id']}")
+    data["archive"] = [n for n in data["archive"] if n.get("id") != note["id"]]
+    note.pop("archived_at", None)
+    data["notes"].append(note)
+    save_data(data)
+
+
+def restore_trashed_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
+    push_undo(data, f"Restore #{note['id']} from trash")
+    data["trash"] = [n for n in data["trash"] if n.get("id") != note["id"]]
+    note.pop("trashed_at", None)
+    data["notes"].append(note)
+    save_data(data)
+
+
 def view_archived_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
     clear()
     draw_header("📦 Archived Note")
     display_note_full(note)
+    draw_inline_menu([("1", "Restore to active"), ("2", "Edit (restore first)"), ("0", "Back")])
+    ch = draw_prompt()
+    if ch == "1":
+        restore_archived_note(data, note)
+        print(f"    {c('✓ Restored', '1;32')}")
+        pause()
+    elif ch == "2":
+        confirm = input("    Restore and edit this note? (y/n): ").strip().lower()
+        if confirm == "y":
+            restore_archived_note(data, note)
+            view_note(data, note)
     draw_inline_menu([("1", "Restore to active"), ("0", "Back")])
     if draw_prompt() == "1":
         push_undo(data, f"Restore #{note['id']}")
@@ -811,6 +976,17 @@ def view_trashed_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
     clear()
     draw_header("🗑️  Trashed Note")
     display_note_full(note)
+    draw_inline_menu([("1", "Restore to active"), ("2", "Edit (restore first)"), ("0", "Back")])
+    ch = draw_prompt()
+    if ch == "1":
+        restore_trashed_note(data, note)
+        print(f"    {c('✓ Restored', '1;32')}")
+        pause()
+    elif ch == "2":
+        confirm = input("    Restore and edit this note? (y/n): ").strip().lower()
+        if confirm == "y":
+            restore_trashed_note(data, note)
+            view_note(data, note)
     draw_inline_menu([("1", "Restore to active"), ("0", "Back")])
     if draw_prompt() == "1":
         push_undo(data, f"Restore #{note['id']} from trash")
@@ -930,11 +1106,7 @@ def archive_browser(data: Dict[str, Any]) -> None:
                 nid = int(raw)
                 for i, n in enumerate(arch):
                     if n.get("id") == nid:
-                        push_undo(data, f"Restore #{nid}")
-                        r = arch.pop(i)
-                        r.pop("archived_at", None)
-                        data["notes"].append(r)
-                        save_data(data)
+                        restore_archived_note(data, n)
                         print(f"    {c('✓ Restored', '1;32')}")
                         pause()
                         break
@@ -974,7 +1146,7 @@ def trash_browser(data: Dict[str, Any]) -> None:
             except Exception:
                 exp_str = ""
             print(f"    {c(f'#{nid:<4}', '1;37')}  {c(td, '90')}  {exp_str}  {note.get('title', 'Untitled')}")
-        opts = [("1", "Restore note"), ("2", "Empty trash")]
+        opts = [("1", "Restore note"), ("2", "Empty trash"), ("3", "View note")]
         if page < tp - 1: opts.append(("8", "Next page →"))
         if page > 0: opts.append(("9", "← Prev page"))
         opts.append(("0", "Back"))
@@ -986,11 +1158,7 @@ def trash_browser(data: Dict[str, Any]) -> None:
                 nid = int(raw)
                 for i, n in enumerate(trash):
                     if n.get("id") == nid:
-                        push_undo(data, f"Restore #{nid} from trash")
-                        r = trash.pop(i)
-                        r.pop("trashed_at", None)
-                        data["notes"].append(r)
-                        save_data(data)
+                        restore_trashed_note(data, n)
                         print(f"    {c('✓ Restored', '1;32')}")
                         pause()
                         break
@@ -1005,6 +1173,15 @@ def trash_browser(data: Dict[str, Any]) -> None:
                 print(f"    {c('✓ Trash emptied', '1;32')}")
                 pause()
                 return
+        elif ch == "3":
+            raw = input("    Note #: ").strip()
+            if raw.isdigit():
+                nid = int(raw)
+                n = next((x for x in trash if x.get("id") == nid), None)
+                if n:
+                    view_trashed_note(data, n)
+                else:
+                    print("    Not found."); pause()
         elif ch == "8" and page < tp - 1: page += 1
         elif ch == "9" and page > 0: page -= 1
         elif ch == "0": return
@@ -1029,6 +1206,7 @@ def quick_note(data: Dict[str, Any]) -> None:
     note = {
         "id": next_id(data), "title": title, "body": body,
         "category": data.get("settings", {}).get("default_category", "General"),
+        "tags": [],
         "created_at": now_iso(), "updated_at": now_iso(), "pinned": False,
     }
     push_undo(data, f"Quick note #{note['id']}")
@@ -1072,6 +1250,19 @@ def show_stats(data: Dict[str, Any]) -> None:
             bl = round((cnt / mx) * 25) if mx else 0
             bar = c("█" * bl, cat_color(cat)) + c("░" * (25 - bl), "90")
             print(f"    {cat:<15} {bar}  {cnt}")
+        print()
+
+    tags: Dict[str, int] = {}
+    for n in all_notes:
+        for tag in n.get("tags", []):
+            tags[tag] = tags.get(tag, 0) + 1
+    if tags:
+        draw_section("By Tag")
+        mx = max(tags.values())
+        for tag, cnt in sorted(tags.items(), key=lambda x: -x[1])[:15]:
+            bl = round((cnt / mx) * 25) if mx else 0
+            bar = c("█" * bl, "36") + c("░" * (25 - bl), "90")
+            print(f"    {tag:<15} {bar}  {cnt}")
         print()
 
     months: Dict[str, int] = {}
@@ -1124,6 +1315,7 @@ def export_menu(data: Dict[str, Any]) -> None:
         ("3", "Export all to plain text"),
         ("4", "Export all to CSV"),
         ("5", "Export all to Excel (.xlsx)"),
+        ("6", "Export filtered (status/category/date)"),
         ("0", "Back"),
     ], columns=1)
     ch = draw_prompt()
@@ -1165,14 +1357,95 @@ def export_menu(data: Dict[str, Any]) -> None:
         export_excel(data, path)
         print(f"\n    {c('✓ Saved:', '1;32')} {path}")
         pause()
+    elif ch == "6":
+        export_filtered_menu(data, edir, ts)
 
 
 def _all_exportable(data: Dict[str, Any]) -> List[Dict]:
     return data.get("notes", []) + data.get("archive", [])
 
 
-def export_all_markdown(data: Dict[str, Any], path: str) -> None:
-    all_n = _all_exportable(data)
+def parse_date_input(raw: str) -> Optional[date]:
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def filter_notes(data: Dict[str, Any], status: str, category: Optional[str],
+                 start: Optional[date], end: Optional[date]) -> List[Dict[str, Any]]:
+    if status == "active":
+        notes = data.get("notes", [])
+    elif status == "archived":
+        notes = data.get("archive", [])
+    else:
+        notes = _all_exportable(data)
+    if category:
+        notes = [n for n in notes if (n.get("category") or "").lower() == category.lower()]
+    if start or end:
+        filtered = []
+        for n in notes:
+            created = (n.get("created_at") or "")[:10]
+            if not created:
+                continue
+            try:
+                created_date = date.fromisoformat(created)
+            except ValueError:
+                continue
+            if start and created_date < start:
+                continue
+            if end and created_date > end:
+                continue
+            filtered.append(n)
+        notes = filtered
+    return notes
+
+
+def export_filtered_menu(data: Dict[str, Any], edir: str, ts: str) -> None:
+    print()
+    draw_section("Filter")
+    draw_inline_menu([("1", "All"), ("2", "Active only"), ("3", "Archived only")])
+    status_choice = draw_prompt()
+    status = "all"
+    if status_choice == "2":
+        status = "active"
+    elif status_choice == "3":
+        status = "archived"
+    cats = data.get("categories", [])
+    if cats:
+        print(f"    Categories: {'  '.join(c(f'[{ct}]', cat_color(ct)) for ct in cats)}")
+    category = input("    Category (blank for all): ").strip() or None
+    start_raw = input("    Start date (YYYY-MM-DD, optional): ").strip()
+    end_raw = input("    End date (YYYY-MM-DD, optional): ").strip()
+    start = parse_date_input(start_raw)
+    end = parse_date_input(end_raw)
+    notes = filter_notes(data, status, category, start, end)
+    if not notes:
+        print(c("    No notes match this filter.", "33"))
+        pause()
+        return
+    print()
+    draw_inline_menu([("1", "Markdown"), ("2", "Plain text"), ("3", "CSV")])
+    fmt = draw_prompt()
+    if fmt == "1":
+        path = os.path.join(edir, f"notes_filtered_{ts}.md")
+        export_markdown_notes(notes, path)
+        print(f"\n    {c('✓ Saved:', '1;32')} {path}")
+    elif fmt == "2":
+        path = os.path.join(edir, f"notes_filtered_{ts}.txt")
+        export_text_notes(notes, path)
+        print(f"\n    {c('✓ Saved:', '1;32')} {path}")
+    elif fmt == "3":
+        path = os.path.join(edir, f"notes_filtered_{ts}.csv")
+        export_csv_notes(notes, path)
+        print(f"\n    {c('✓ Saved:', '1;32')} {path}")
+    pause()
+
+def export_markdown_notes(notes: List[Dict[str, Any]], path: str) -> None:
+    all_n = notes
     with open(path, "w", encoding="utf-8") as f:
         f.write(f"# Notes Vault Export — {today_str()}\n\nTotal: {len(all_n)} notes\n\n---\n\n")
         cats: Dict[str, List[Dict]] = {}
@@ -1187,42 +1460,60 @@ def export_all_markdown(data: Dict[str, Any], path: str) -> None:
                 f.write(f"*Created: {n.get('created_at', '')[:16]}")
                 if n.get("updated_at") and n["updated_at"] != n.get("created_at"):
                     f.write(f" · Updated: {n['updated_at'][:16]}")
+                tags = format_tags(n.get("tags", []))
+                if tags:
+                    f.write(f" · Tags: {tags}")
                 f.write(f"*\n\n{n.get('body', '')}\n\n---\n\n")
+
+
+def export_all_markdown(data: Dict[str, Any], path: str) -> None:
+    export_markdown_notes(_all_exportable(data), path)
 
 
 def export_single_markdown(note: Dict[str, Any], path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         pin = "📌 " if note.get("pinned") else ""
         f.write(f"# {pin}{note.get('title', 'Untitled')}\n\n")
-        f.write(f"*Category: {note.get('category', '')} · Created: {note.get('created_at', '')[:16]}*\n\n")
+        tags = format_tags(note.get("tags", []))
+        tags_part = f" · Tags: {tags}" if tags else ""
+        f.write(f"*Category: {note.get('category', '')}{tags_part} · Created: {note.get('created_at', '')[:16]}*\n\n")
         f.write(note.get("body", "") + "\n")
 
 
-def export_all_text(data: Dict[str, Any], path: str) -> None:
+def export_text_notes(notes: List[Dict[str, Any]], path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
-        for n in sorted(_all_exportable(data), key=lambda x: x.get("created_at", ""), reverse=True):
+        for n in sorted(notes, key=lambda x: x.get("created_at", ""), reverse=True):
             f.write(f"{'=' * 60}\n#{n.get('id')} — {n.get('title', 'Untitled')}\n")
-            f.write(f"Category: {n.get('category', '')}  |  {n.get('created_at', '')[:16]}\n")
+            tags = format_tags(n.get("tags", []))
+            f.write(f"Category: {n.get('category', '')}  |  Tags: {tags}  |  {n.get('created_at', '')[:16]}\n")
             f.write(f"{'=' * 60}\n\n{n.get('body', '')}\n\n\n")
 
 
-def export_csv(data: Dict[str, Any], path: str) -> None:
-    all_n = _all_exportable(data)
+def export_all_text(data: Dict[str, Any], path: str) -> None:
+    export_text_notes(_all_exportable(data), path)
+
+
+def export_csv_notes(notes: List[Dict[str, Any]], path: str) -> None:
+    all_n = notes
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["ID", "Title", "Category", "Status", "Pinned", "Created", "Updated",
-                     "Word Count", "Char Count", "Body Preview (100 chars)", "Full Body"])
+        w.writerow(["ID", "Title", "Category", "Tags", "Status", "Pinned", "Created", "Updated",
+                    "Word Count", "Char Count", "Body Preview (100 chars)", "Full Body"])
         for n in sorted(all_n, key=lambda x: x.get("created_at", ""), reverse=True):
             body = n.get("body", "")
             wc = len(body.split()) if body else 0
             status = "Archived" if n.get("archived_at") else "Active"
             preview = body.replace("\n", " ")[:100]
             w.writerow([
-                n.get("id"), n.get("title", ""), n.get("category", ""),
+                n.get("id"), n.get("title", ""), n.get("category", ""), format_tags(n.get("tags", [])),
                 status, "Yes" if n.get("pinned") else "No",
                 n.get("created_at", "")[:16], (n.get("updated_at") or "")[:16],
                 wc, len(body), preview, body,
             ])
+
+
+def export_csv(data: Dict[str, Any], path: str) -> None:
+    export_csv_notes(_all_exportable(data), path)
 
 
 def export_excel(data: Dict[str, Any], path: str) -> None:
@@ -1252,7 +1543,7 @@ def export_excel(data: Dict[str, Any], path: str) -> None:
     top_align = Alignment(vertical="top")
 
     # Headers
-    headers = ["ID", "Title", "Category", "Status", "Pinned", "Created", "Updated",
+    headers = ["ID", "Title", "Category", "Tags", "Status", "Pinned", "Created", "Updated",
                "Words", "Chars", "Body"]
     for col, h in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col, value=h)
@@ -1268,7 +1559,7 @@ def export_excel(data: Dict[str, Any], path: str) -> None:
         is_pinned = n.get("pinned", False)
 
         values = [
-            n.get("id"), n.get("title", ""), n.get("category", ""),
+            n.get("id"), n.get("title", ""), n.get("category", ""), format_tags(n.get("tags", [])),
             status, "📌" if is_pinned else "",
             n.get("created_at", "")[:16], (n.get("updated_at") or "")[:16],
             wc, len(body), body,
@@ -1285,14 +1576,14 @@ def export_excel(data: Dict[str, Any], path: str) -> None:
                 ws.cell(row=row_idx, column=col).fill = PatternFill("solid", fgColor="FFF8E1")
 
         # Date columns in gray
-        for col in (6, 7):
+        for col in (7, 8):
             ws.cell(row=row_idx, column=col).font = date_font
 
         # Body column wrap
-        ws.cell(row=row_idx, column=10).alignment = wrap_align
+        ws.cell(row=row_idx, column=11).alignment = wrap_align
 
     # Column widths
-    widths = [6, 35, 14, 10, 7, 18, 18, 8, 8, 60]
+    widths = [6, 35, 14, 18, 10, 7, 18, 18, 8, 8, 60]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[chr(64 + i) if i <= 26 else "A"].width = w
 
@@ -1300,7 +1591,7 @@ def export_excel(data: Dict[str, Any], path: str) -> None:
     ws.freeze_panes = "A2"
 
     # Auto-filter
-    ws.auto_filter.ref = f"A1:J{len(all_n) + 1}"
+    ws.auto_filter.ref = f"A1:K{len(all_n) + 1}"
 
     wb.save(path)
 
@@ -1323,6 +1614,9 @@ def settings_menu(data: Dict[str, Any]) -> None:
         trash_days = settings.get("trash_days", 30)
         print(f"    Default category   {c(settings.get('default_category', 'General'), '35')}")
         print(f"    Editor hints       {hint_st}")
+        ext_editor = settings.get("use_external_editor", False)
+        ext_editor_st = c("ON", "32") if ext_editor else c("OFF", "31")
+        print(f"    External editor    {ext_editor_st}")
         print(f"    Trash retention    {c(f'{trash_days} days', '33')}")
         print(f"    Categories         {'  '.join(c(f'[{ct}]', cat_color(ct)) for ct in cats)}")
         if templates:
@@ -1343,6 +1637,7 @@ def settings_menu(data: Dict[str, Any]) -> None:
             ("6", "Change export directory"),
             ("7", "Set trash retention days"),
             ("8", "Manage templates"),
+            ("9", "Toggle external editor"),
             ("0", "Back"),
         ], columns=1)
 
@@ -1437,6 +1732,10 @@ def settings_menu(data: Dict[str, Any]) -> None:
         elif ch == "8":
             manage_templates(data)
 
+        elif ch == "9":
+            settings["use_external_editor"] = not settings.get("use_external_editor", False)
+            save_data(data)
+
         elif ch == "0":
             return
 
@@ -1454,7 +1753,7 @@ def manage_templates(data: Dict[str, Any]) -> None:
                 print(f"    {c(f'[{i}]', '36')}  {c(t['name'], '1;37')}")
                 print(f"         {c(preview + '...', '90')}")
             print()
-        draw_inline_menu([("1", "Add template"), ("2", "Remove template"), ("0", "Back")])
+        draw_inline_menu([("1", "Add template"), ("2", "Remove template"), ("3", "Edit template"), ("0", "Back")])
         ch = draw_prompt()
         if ch == "1":
             name = input("    Template name: ").strip()
@@ -1478,6 +1777,24 @@ def manage_templates(data: Dict[str, Any]) -> None:
                         save_data(data)
                         rname = removed.get("name", "")
                         print(f"    {c(f'✓ Removed: {rname}', '1;32')}")
+                        pause()
+        elif ch == "3":
+            if templates:
+                raw = input("    Template number to edit: ").strip()
+                if raw.isdigit():
+                    idx = int(raw) - 1
+                    if 0 <= idx < len(templates):
+                        tmpl = templates[idx]
+                        new_name = input(f"    Name [{tmpl.get('name', '')}]: ").strip()
+                        if new_name:
+                            tmpl["name"] = new_name
+                        print(c("\n    Edit template body (leave blank to keep current):", "90"))
+                        body = multiline_input(existing=tmpl.get("body", ""), hint=False)
+                        if body != "__CANCEL__":
+                            tmpl["body"] = body
+                        data["templates"] = templates
+                        save_data(data)
+                        print(f"    {c('✓ Template updated', '1;32')}")
                         pause()
         elif ch == "0":
             return
