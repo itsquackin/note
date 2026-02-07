@@ -438,6 +438,106 @@ def multiline_input(existing: str = "", hint: bool = True) -> str:
     return existing
 
 
+def external_editor_input(existing: str = "") -> Optional[str]:
+    editor = os.environ.get("EDITOR")
+    if not editor:
+        print(c("    ⚠ $EDITOR not set. Falling back to inline editor.", "33"))
+        return None
+    with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False) as tmp:
+        path = tmp.name
+        if existing:
+            tmp.write(existing)
+            tmp.flush()
+    try:
+        cmd = shlex.split(editor) + [path]
+        subprocess.call(cmd)
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read().rstrip("\n")
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def body_input(existing: str, hint: bool, settings: Dict[str, Any]) -> str:
+    if settings.get("use_external_editor", False):
+        edited = external_editor_input(existing)
+        if edited is not None:
+            return edited
+    return multiline_input(existing=existing, hint=hint)
+
+
+def build_meeting_note_body() -> str:
+    print(c("    Fill in meeting sections. Use :done on a blank line to finish each section.", "90"))
+    print()
+    attendees = input("    Attendees (comma-separated): ").strip()
+    print()
+    print(c("    Agenda:", "90"))
+    agenda = multiline_input(hint=False)
+    print()
+    print(c("    Discussion:", "90"))
+    discussion = multiline_input(hint=False)
+    print()
+    print(c("    Action Items:", "90"))
+    action_items = multiline_input(hint=False)
+    return (
+        "Attendees:\n"
+        f"{attendees}\n\n"
+        "Agenda:\n"
+        f"{agenda}\n\n"
+        "Discussion:\n"
+        f"{discussion}\n\n"
+        "Action Items:\n"
+        f"{action_items}\n"
+    )
+
+
+def build_todo_note_body(lines: List[str]) -> str:
+    print(c("    Fill in to-do items. Use :done on a blank line to finish each item.", "90"))
+    items = []
+    for idx, line in enumerate(lines, 1):
+        prompt = f"    Item {idx}: "
+        item = input(prompt).strip()
+        items.append(f"[ ] {item}" if item else line)
+    return "\n".join(items) + "\n"
+
+
+def build_sectioned_template_body(template_body: str) -> Optional[str]:
+    lines = template_body.splitlines()
+    headers = [line for line in lines if line.strip().endswith(":") and not line.strip().startswith("[")]
+    if not headers:
+        return None
+    print(c("    Fill in template sections. Use :done on a blank line to finish each section.", "90"))
+    print()
+    filled_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.endswith(":") and not stripped.startswith("["):
+            print(c(f"    {line}", "90"))
+            section_body = multiline_input(hint=False)
+            filled_lines.append(line)
+            if section_body:
+                filled_lines.append(section_body)
+            print()
+        elif stripped:
+            filled_lines.append(line)
+    return "\n".join(filled_lines).rstrip("\n") + "\n"
+
+
+def build_template_body(template_name: str, template_body: str, settings: Dict[str, Any]) -> str:
+    name_lower = template_name.lower()
+    if name_lower == "meeting notes":
+        return build_meeting_note_body()
+    todo_lines = [line for line in template_body.splitlines() if line.strip().startswith("[")]
+    if name_lower in ("to-do list", "todo list") or todo_lines:
+        return build_todo_note_body(todo_lines or template_body.splitlines())
+    sectioned = build_sectioned_template_body(template_body)
+    if sectioned is not None:
+        return sectioned
+    return body_input(existing=template_body, hint=settings.get("editor_hint", True), settings=settings)
+
+
 def build_meeting_note_body() -> str:
     print(c("    Fill in meeting sections. Use :done on a blank line to finish each section.", "90"))
     print()
@@ -1644,11 +1744,18 @@ def settings_menu(data: Dict[str, Any]) -> None:
         ch = draw_prompt()
 
         if ch == "1":
-            if cats: print(f"    Available: {', '.join(cats)}")
-            new = input("    Default category: ").strip()
+            if cats:
+                for i, ct in enumerate(cats, 1):
+                    print(f"      {c(f'[{i}]', '36')} {ct}")
+            new = input("    Default category (name or #): ").strip()
             if new:
-                settings["default_category"] = new
-                if new not in cats: cats.append(new)
+                if new.isdigit() and 1 <= int(new) <= len(cats):
+                    selected = cats[int(new) - 1]
+                else:
+                    selected = new
+                settings["default_category"] = selected
+                if selected not in cats:
+                    cats.append(selected)
                 save_data(data)
 
         elif ch == "2":
