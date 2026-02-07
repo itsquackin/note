@@ -375,6 +375,31 @@ def multiline_input(existing: str = "", hint: bool = True) -> str:
     return existing
 
 
+def build_meeting_note_body() -> str:
+    print(c("    Fill in meeting sections. Use :done on a blank line to finish each section.", "90"))
+    print()
+    attendees = input("    Attendees (comma-separated): ").strip()
+    print()
+    print(c("    Agenda:", "90"))
+    agenda = multiline_input(hint=False)
+    print()
+    print(c("    Discussion:", "90"))
+    discussion = multiline_input(hint=False)
+    print()
+    print(c("    Action Items:", "90"))
+    action_items = multiline_input(hint=False)
+    return (
+        "Attendees:\n"
+        f"{attendees}\n\n"
+        "Agenda:\n"
+        f"{agenda}\n\n"
+        "Discussion:\n"
+        f"{discussion}\n\n"
+        "Action Items:\n"
+        f"{action_items}\n"
+    )
+
+
 # ════════════════════════════════════════════════════════════════
 #  NOTE OPERATIONS
 # ════════════════════════════════════════════════════════════════
@@ -385,6 +410,8 @@ def create_note(data: Dict[str, Any]) -> None:
 
     # Template selection
     templates = data.get("templates", [])
+    template_name = ""
+    template_body = ""
     if templates:
         draw_section("Start from template?")
         print(f"    {c('[0]', '36')}  Blank note")
@@ -392,9 +419,10 @@ def create_note(data: Dict[str, Any]) -> None:
             print(f"    {c(f'[{i}]', '36')}  {t['name']}")
         print()
         tmpl_choice = draw_prompt()
-        template_body = ""
         if tmpl_choice.isdigit() and 1 <= int(tmpl_choice) <= len(templates):
-            template_body = templates[int(tmpl_choice) - 1]["body"]
+            selected_template = templates[int(tmpl_choice) - 1]
+            template_name = selected_template.get("name", "")
+            template_body = selected_template.get("body", "")
         print()
 
     title = input("    Title: ").strip()
@@ -413,10 +441,13 @@ def create_note(data: Dict[str, Any]) -> None:
         data["categories"] = cats
 
     print()
-    initial = template_body if templates and template_body else ""
-    if initial:
-        print(c(f"    Template loaded: {templates[int(tmpl_choice)-1]['name']}\n", "36"))
-    body = multiline_input(existing=initial, hint=data.get("settings", {}).get("editor_hint", True))
+    if template_name.lower() == "meeting notes":
+        body = build_meeting_note_body()
+    else:
+        initial = template_body if templates and template_body else ""
+        if initial:
+            print(c(f"    Template loaded: {template_name}\n", "36"))
+        body = multiline_input(existing=initial, hint=data.get("settings", {}).get("editor_hint", True))
     if body == "__CANCEL__":
         print("    Cancelled.")
         pause()
@@ -458,15 +489,20 @@ def view_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
 def edit_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
     clear()
     draw_header(f"✏️  Edit: {note['title']}")
+    pushed_undo = False
     new_title = input(f"    Title [{note['title']}]: ").strip()
     if new_title:
         push_undo(data, f"Edit note #{note['id']}")
+        pushed_undo = True
         note["title"] = new_title
     cats = data.get("categories", [])
     if cats:
         print(f"    Categories: {'  '.join(c(f'[{ct}]', cat_color(ct)) for ct in cats)}")
     new_cat = input(f"    Category [{note.get('category', 'General')}]: ").strip()
     if new_cat:
+        if not pushed_undo:
+            push_undo(data, f"Edit note #{note['id']}")
+            pushed_undo = True
         note["category"] = new_cat
         if new_cat not in cats:
             cats.append(new_cat)
@@ -477,12 +513,16 @@ def edit_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
         draw_inline_menu([("1", "Rewrite from scratch"), ("2", "Edit (load existing)"), ("0", "Keep")])
         ec = draw_prompt()
         if ec == "1":
-            push_undo(data, f"Rewrite #{note['id']}")
+            if not pushed_undo:
+                push_undo(data, f"Rewrite #{note['id']}")
+                pushed_undo = True
             body = multiline_input()
             if body != "__CANCEL__":
                 note["body"] = body
         elif ec == "2":
-            push_undo(data, f"Edit body #{note['id']}")
+            if not pushed_undo:
+                push_undo(data, f"Edit body #{note['id']}")
+                pushed_undo = True
             body = multiline_input(existing=note.get("body", ""))
             if body != "__CANCEL__":
                 note["body"] = body
@@ -600,8 +640,9 @@ def sort_notes(notes: List[Dict], mode: str = "recent", pinned_first: bool = Tru
         # Pinned first, then oldest
         pinned = [n for n in notes if n.get("pinned")] if pinned_first else []
         unpinned = [n for n in notes if not n.get("pinned")] if pinned_first else notes
+        pinned_sorted = sorted(pinned, key=lambda n: n.get("created_at") or "")
         unpinned_sorted = sorted(unpinned, key=lambda n: n.get("created_at") or "")
-        result = pinned + unpinned_sorted
+        result = pinned_sorted + unpinned_sorted
 
     return result
 
@@ -617,6 +658,10 @@ def open_note_by_id(data: Dict[str, Any], raw: str) -> None:
     note = next((n for n in data.get("archive", []) if n.get("id") == nid), None)
     if note:
         view_archived_note(data, note)
+        return
+    note = next((n for n in data.get("trash", []) if n.get("id") == nid), None)
+    if note:
+        view_trashed_note(data, note)
         return
     print("    Not found.")
     pause()
@@ -756,6 +801,21 @@ def view_archived_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
         push_undo(data, f"Restore #{note['id']}")
         data["archive"] = [n for n in data["archive"] if n.get("id") != note["id"]]
         note.pop("archived_at", None)
+        data["notes"].append(note)
+        save_data(data)
+        print(f"    {c('✓ Restored', '1;32')}")
+        pause()
+
+
+def view_trashed_note(data: Dict[str, Any], note: Dict[str, Any]) -> None:
+    clear()
+    draw_header("🗑️  Trashed Note")
+    display_note_full(note)
+    draw_inline_menu([("1", "Restore to active"), ("0", "Back")])
+    if draw_prompt() == "1":
+        push_undo(data, f"Restore #{note['id']} from trash")
+        data["trash"] = [n for n in data["trash"] if n.get("id") != note["id"]]
+        note.pop("trashed_at", None)
         data["notes"].append(note)
         save_data(data)
         print(f"    {c('✓ Restored', '1;32')}")
@@ -1313,6 +1373,19 @@ def settings_menu(data: Dict[str, Any]) -> None:
                     print(f"      {c(f'[{i}]', '36')} {ct}")
             name = input("    Category to remove: ").strip()
             if name in cats:
+                affected_notes = [
+                    n for n in (data.get("notes", []) + data.get("archive", []) + data.get("trash", []))
+                    if (n.get("category") or "").lower() == name.lower()
+                ]
+                if affected_notes:
+                    default_cat = settings.get("default_category", "General")
+                    print(c(f"    {len(affected_notes)} notes use \"{name}\".", "33"))
+                    replace = input(f"    Replace with category [{default_cat}]: ").strip() or default_cat
+                    for n in affected_notes:
+                        n["category"] = replace
+                    if replace not in cats:
+                        cats.append(replace)
+                    save_data(data)
                 cats.remove(name)
                 data["categories"] = cats
                 save_data(data)
